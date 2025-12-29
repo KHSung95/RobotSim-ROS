@@ -14,5 +14,5 @@ else
     exit 1
 fi
 
-echo "Launching ur5e_unity_bridge..."
-ros2 launch ur5e_unity_bridge bringup.launch.py "$@"
+echo "Launching ur5e_unity_bridge (Integration Mode)..."
+ros2 launch ur5e_unity_bridge integration.launch.py "$@"

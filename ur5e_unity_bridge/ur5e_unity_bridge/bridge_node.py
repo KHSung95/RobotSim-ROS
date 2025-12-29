@@ -1,145 +1,212 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-from rclpy.action import ActionClient
-from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import String
-from moveit_msgs.action import MoveGroup
-from moveit_msgs.msg import Constraints, PositionConstraint, OrientationConstraint
-from shape_msgs.msg import SolidPrimitive
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+import time
+
+from geometry_msgs.msg import PoseStamped, TwistStamped
+from std_msgs.msg import String, Int8
+from std_srvs.srv import Trigger
 from sensor_msgs.msg import JointState
+from control_msgs.msg import JointJog
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from moveit_msgs.srv import GetCartesianPath
 
 class UR5eUnityBridge(Node):
     def __init__(self):
         super().__init__('ur5e_unity_bridge')
         
-        # 1. Heartbeat Publisher
-        self.health_pub = self.create_publisher(String, '/unity/health', 10)
-        
-        # [NEW] Unity 전용 JointState Publisher (NaN 제거 버전)
-        self.unity_joint_pub = self.create_publisher(JointState, '/unity/joint_states', 10)
-        
-        # [NEW] 원본 JointState Subscriber
-        self.joint_state_sub = self.create_subscription(
-            JointState,
-            '/joint_states',
-            self.joint_state_callback,
-            10
-        )
-        
-        self.timer = self.create_timer(1.0, self.timer_callback)
-        self.heartbeat_count = 0
-        
-        # 2. Unity로부터 Target Pose를 받는 Subscriber
-        self.target_sub = self.create_subscription(
-            PoseStamped,
-            '/unity/target_pose',
-            self.target_pose_callback,
-            10
+        # QoS 프로파일 정의 (MoveIt Controller와의 호환성 고려)
+        self.qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
         )
 
-        # 3. Unity로부터 직접 조인트 명령을 받는 Subscriber (에러 해결 및 모니터링용)
-        self.joint_command_sub = self.create_subscription(
-            JointState,
-            '/joint_command',
-            self.joint_command_callback,
-            10
-        )
+        # 1. Publishers (ROS -> Unity / Robot)
+        self.unity_health_pub = self.create_publisher(String, '/unity/health', 10)
+        self.unity_joint_state_pub = self.create_publisher(JointState, '/unity/joint_states', 10)
         
-        # 4. MoveIt2의 move_group 액션 클라이언트
-        self.move_group_client = ActionClient(self, MoveGroup, 'move_action')
+        # Robot Control Publishers
+        self.robot_traj_pub = self.create_publisher(JointTrajectory, '/scaled_joint_trajectory_controller/joint_trajectory', 10)
+        self.robot_servo_twist_pub = self.create_publisher(TwistStamped, '/servo_node/delta_twist_cmds', self.qos)
+        self.robot_servo_jog_pub = self.create_publisher(JointJog, '/servo_node/delta_joint_cmds', self.qos)
         
+        # 2. Subscribers (Unity -> ROS)
+        self.unity_target_sub = self.create_subscription(PoseStamped, '/unity/target_pose', self.unity_target_pose_callback, 10)
+        self.unity_joint_traj_sub = self.create_subscription(JointState, '/joint_commands', self.unity_joint_traj_callback, 10)
+        self.unity_joint_jog_sub = self.create_subscription(JointJog, '/unity/joint_jog', self.unity_joint_jog_callback, self.qos)
+        self.unity_twist_sub = self.create_subscription(TwistStamped, '/servo_node/delta_twist_cmds_unity', self.unity_twist_callback, self.qos)
+        self.unity_trajectory_sub = self.create_subscription(JointTrajectory, '/unity/joint_trajectory', self.unity_trajectory_callback, 10)
+        
+        # 3. Service Bridge
+        self.cartesian_path_service = self.create_service(GetCartesianPath, '/compute_cartesian_path', self.compute_cartesian_path_callback)
+        self.moveit_cartesian_client = self.create_client(GetCartesianPath, 'compute_cartesian_path')
+        
+        # 4. Status Subscribers (Robot -> Bridge)
+        self.robot_joint_state_sub = self.create_subscription(JointState, '/joint_states', self.robot_joint_state_callback, 10)
+        self.robot_servo_status_sub = self.create_subscription(Int8, '/servo_node/status', self.robot_servo_status_callback, 10)
+        
+        # Status & Monitoring Variables
+        self.msg_count = {"twist": 0, "joint_cmd": 0, "joint_state": 0, "jog": 0}
+        self.last_servo_cmd_time = self.get_clock().now()
+        self.current_servo_status = 0 # 0: Normal
+        self.timer = self.create_timer(1.0, self.check_log_rate)
+
+        # 5. Service Clients (For Servo Control)
+        self.start_servo_client = self.create_client(Trigger, '/servo_node/start_servo')
+        
+        # 6. Automatic Startup Logic
+        self.servo_started = False
+        self.auto_start_timer = self.create_timer(2.0, self.auto_start_callback)
+
         self.get_logger().info("==========================================")
-        self.get_logger().info("   UR5e Unity Bridge Diagnostics Mode     ")
+        self.get_logger().info("   UR5e Unity Bridge [v2.2 - Optimized]   ")
         self.get_logger().info("==========================================")
-        self.get_logger().info("Listening on: /unity/target_pose")
-        self.get_logger().info("Publishing to: /unity/health")
 
-    def timer_callback(self):
-        msg = String()
-        msg.data = f"ROS2 Heartbeat - {self.get_clock().now().to_msg().sec}"
-        self.health_pub.publish(msg)
-        
-        self.heartbeat_count += 1
-        if self.heartbeat_count % 10 == 0:
-            self.get_logger().info(f"Alive: Sending Heartbeat to Unity (count: {self.heartbeat_count})")
+    def check_log_rate(self):
+        """통신 상태 모니터링 (1Hz)"""
+        self.get_logger().info(
+            f"Hz Check | Twist:{self.msg_count['twist']} | JointCmd:{self.msg_count['joint_cmd']} | "
+            f"JointState:{self.msg_count['joint_state']} | Jog:{self.msg_count['jog']}"
+        )
+        # 카운터 초기화
+        for key in self.msg_count: self.msg_count[key] = 0
 
-    def joint_state_callback(self, msg: JointState):
-        """
-        ROS의 /joint_states를 받아서 Unity가 이해하기 쉽게 재가공하여 보냅니다.
-        특히 effort에 포함된 NaN 값을 0.0으로 바꿉니다.
-        """
+    def robot_joint_state_callback(self, msg: JointState):
+        """로봇 -> Unity 상태 동기화"""
+        self.msg_count["joint_state"] += 1
         new_msg = JointState()
-        new_msg.header = msg.header
+        # [중요] Unity 타임스탬프 문제를 해결하기 위해 ROS 시간으로 덮어씀
+        new_msg.header.stamp = self.get_clock().now().to_msg()
+        new_msg.header.frame_id = msg.header.frame_id if msg.header.frame_id else "base_link"
         new_msg.name = msg.name
         new_msg.position = msg.position
         new_msg.velocity = msg.velocity
         new_msg.effort = [0.0] * len(msg.name)
+        self.unity_joint_state_pub.publish(new_msg)
+
+    def unity_twist_callback(self, msg: TwistStamped):
+        """Unity -> Servo Twist 명령 (Cartesian Jog)"""
+        self.msg_count["twist"] += 1
         
-        self.unity_joint_pub.publish(new_msg)
+        # [수비적 설계] 에러 상태(특이점, 충돌 등)일 때는 Twist 명령을 무시함
+        # 불필요한 연산과 경고 로그를 줄이고, JointJog를 통한 탈출을 유도함
+        if self.current_servo_status != 0:
+            return 
 
-    def target_pose_callback(self, msg: PoseStamped):
-        self.get_logger().info(f"Target Received: ({msg.pose.position.x:.3f}, {msg.pose.position.y:.3f}, {msg.pose.position.z:.3f})")
-        self.send_move_goal(msg)
+        self.last_servo_cmd_time = self.get_clock().now()
+        
+        # 타임스탬프 갱신 (Servo 타임아웃 방지)
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "base_link"
+        self.robot_servo_twist_pub.publish(msg)
 
-    def joint_command_callback(self, msg: JointState):
-        pass # 현재는 타입 추론용으로만 사용 (Unity -> ROS)
+        # [수정됨] 과잉 호출 방지: try_start_servo() 제거됨
 
-    def send_move_goal(self, target_pose: PoseStamped):
-        if not self.move_group_client.wait_for_server(timeout_sec=1.0):
-            self.get_logger().warn("MoveIt2 action server ('move_action') not found!")
+    def unity_joint_jog_callback(self, msg: JointJog):
+        """Unity -> Servo Joint Jog 명령 (관절 개별 제어)"""
+        self.msg_count["jog"] += 1
+        self.last_servo_cmd_time = self.get_clock().now()
+        
+        # 타임스탬프 갱신
+        msg.header.stamp = self.get_clock().now().to_msg()
+        if not msg.header.frame_id: msg.header.frame_id = "base_link"
+        
+        # [참고] JointJog는 특이점 탈출용이므로 status != 0 이어도 퍼블리시 함
+        self.robot_servo_jog_pub.publish(msg)
+
+        # [수정됨] 과잉 호출 방지: try_start_servo() 제거됨
+
+    def unity_joint_traj_callback(self, msg: JointState):
+        """Unity -> Scaled Controller (Move to Pose 등)"""
+        if not msg.name or not msg.position: return
+        self.msg_count["joint_cmd"] += 1
+        
+        # Servo와 Controller 간의 충돌 방지 (Servo 사용 직후엔 잠시 대기)
+        dt = (self.get_clock().now() - self.last_servo_cmd_time).nanoseconds / 1e9
+        if dt < 0.5:
             return
 
-        goal_msg = MoveGroup.Goal()
-        goal_msg.request.group_name = "ur_manipulator" # ur_moveit_config 기준 표준 이름
-        goal_msg.request.num_planning_attempts = 10
-        goal_msg.request.allowed_planning_time = 5.0
-        
-        # Goal Constraints
-        pos_con = PositionConstraint()
-        pos_con.header = target_pose.header
-        pos_con.link_name = "tool0"
-        pos_con.constraint_region.primitives.append(SolidPrimitive(type=SolidPrimitive.SPHERE, dimensions=[0.05])) # 5cm 오차 허용
-        pos_con.constraint_region.primitive_poses.append(target_pose.pose)
-        pos_con.weight = 1.0
-        
-        ori_con = OrientationConstraint()
-        ori_con.header = target_pose.header
-        ori_con.link_name = "tool0"
-        ori_con.orientation = target_pose.pose.orientation
-        ori_con.absolute_x_axis_tolerance = 0.1 # 약 5.7도 허용
-        ori_con.absolute_y_axis_tolerance = 0.1
-        ori_con.absolute_z_axis_tolerance = 0.1
-        ori_con.weight = 1.0
-        
-        constraints = Constraints()
-        constraints.position_constraints.append(pos_con)
-        constraints.orientation_constraints.append(ori_con)
-        goal_msg.request.goal_constraints.append(constraints)
-        
-        # 추가적인 안정성 설정
-        goal_msg.request.num_planning_attempts = 20
-        goal_msg.request.allowed_planning_time = 10.0
-        goal_msg.request.max_velocity_scaling_factor = 0.5 # 속도 50%
-        goal_msg.request.max_acceleration_scaling_factor = 0.5
-        self._send_goal_future = self.move_group_client.send_goal_async(goal_msg)
-        self._send_goal_future.add_done_callback(self.goal_response_callback)
+        traj_msg = JointTrajectory()
+        traj_msg.header.stamp = self.get_clock().now().to_msg()
+        traj_msg.joint_names = msg.name 
+        point = JointTrajectoryPoint()
+        point.positions = msg.position
+        # 안전을 위해 빈 속도 배열이라도 채워서 보냄
+        point.velocities = [0.0] * len(msg.position)
+        point.time_from_start.nanosec = 200000000 # 0.2s
+        traj_msg.points = [point]
+        self.robot_traj_pub.publish(traj_msg)
 
-    def goal_response_callback(self, future):
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().error('Goal REJECTED by MoveIt2')
+    def unity_trajectory_callback(self, msg: JointTrajectory):
+        """Unity에서 계산된 궤적(Cartesian Path 등)을 바로 실행"""
+        self.get_logger().info("Unity Trajectory 실행 요청 수신")
+        
+        dt = (self.get_clock().now() - self.last_servo_cmd_time).nanoseconds / 1e9
+        if dt < 0.5: return
+
+        msg.header.stamp = self.get_clock().now().to_msg()
+        if not msg.header.frame_id: msg.header.frame_id = "base_link"
+        self.robot_traj_pub.publish(msg)
+
+    async def compute_cartesian_path_callback(self, request, response):
+        """Unity -> MoveIt Cartesian Path 계산 서비스 중계"""
+        if request.header.frame_id == "":
+            request.header.frame_id = "base_link"
+            
+        if not self.moveit_cartesian_client.service_is_ready():
+            self.get_logger().warn("MoveIt Cartesian 서비스가 준비되지 않았습니다.")
+            return response
+            
+        # 비동기 호출로 MoveIt에 경로 계산 요청
+        result = await self.moveit_cartesian_client.call_async(request)
+        return result
+
+    def robot_servo_status_callback(self, msg: Int8):
+        """Servo 상태 모니터링 및 로깅"""
+        # 상태가 변하지 않았으면 리턴 (로그 스팸 방지)
+        if msg.data == self.current_servo_status:
             return
-        self.get_logger().info('Goal ACCEPTED. Starting execution...')
-        self._get_result_future = goal_handle.get_result_async()
-        self._get_result_future.add_done_callback(self.get_result_callback)
+            
+        self.current_servo_status = msg.data
+        status_map = {0: "정상(Normal)", 1: "경고(Warn)", 2: "특이점 정지(Singularity Halt)", 3: "경계", 4: "한계 정지(Limit Halt)", 5: "충돌 위험(Collision)", 6: "오류"}
+        status_str = status_map.get(msg.data, f"알 수 없음 ({msg.data})")
+        
+        # Unity 화면에 표시할 수 있도록 Health 토픽으로도 전송 추천
+        health_msg = String()
+        health_msg.data = f"Servo Status: {status_str}"
+        self.unity_health_pub.publish(health_msg)
 
-    def get_result_callback(self, future):
-        result = future.result().result
-        if result.error_code.val == 1:
-            self.get_logger().info('SUCCESS: Robot moved to target.')
+        if msg.data == 0:
+            self.get_logger().info(f"Servo 상태 회복: {status_str}")
         else:
-            self.get_logger().error(f'FAILURE: MoveIt error code {result.error_code.val}')
+            self.get_logger().warn(f"Servo 상태 변경: {status_str} -> 조치 필요")
+
+    def auto_start_callback(self):
+        """노드 시작 시 Servo를 자동으로 켜주는 로직 (1회성)"""
+        if self.servo_started:
+            self.auto_start_timer.cancel()
+            return
+            
+        if self.start_servo_client.service_is_ready():
+            self.get_logger().info("Servo 서비스 감지됨. 자동 시작 시도...")
+            self.try_start_servo()
+            self.servo_started = True
+            self.auto_start_timer.cancel()
+        else:
+            self.get_logger().info("Servo 서비스 대기 중...", once=True)
+
+    def try_start_servo(self):
+        """Servo 활성화 요청"""
+        if not self.start_servo_client.service_is_ready():
+            return
+        self.get_logger().info("Servo Enable 요청 전송 (/servo_node/start_servo)")
+        req = Trigger.Request()
+        self.start_servo_client.call_async(req)
+
+    def unity_target_pose_callback(self, msg: PoseStamped):
+        pass
 
 def main(args=None):
     rclpy.init(args=args)
@@ -148,8 +215,12 @@ def main(args=None):
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    node.destroy_node()
-    rclpy.shutdown()
+    except Exception as e:
+        node.get_logger().error(f"Error in bridge node: {e}")
+    finally:
+        if rclpy.ok():
+            node.destroy_node()
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

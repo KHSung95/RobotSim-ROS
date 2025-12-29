@@ -16,12 +16,12 @@ def generate_launch_description():
     ur_moveit_config_pkg = FindPackageShare('ur_moveit_config').find('ur_moveit_config')
     ur5e_bridge_pkg = FindPackageShare('ur5e_unity_bridge').find('ur5e_unity_bridge')
     
-    # 1. Robot Description (Xacro로 제대로 로드)
-    # 공식 ur_description 패키지의 xacro를 사용하거나, 브릿지 패키지 내의 xacro를 사용합니다.
+    # 1. Robot Description (In-memory renaming to 'ur' to match moveit_config)
     robot_description_content = Command(
         [
-            FindExecutable(name="xacro"), " ",
-            os.path.join(ur5e_bridge_pkg, "urdf", "ur5e.urdf"), # 현재 가지고 계신 URDF가 이미 xacro 결과물이면 이를 그대로 사용
+            "sh -c '", 
+            FindExecutable(name="xacro"), " ", os.path.join(ur5e_bridge_pkg, "urdf", "ur5e.urdf"),
+            " | sed \"s/robot name=\\\"ur5e\\\"/robot name=\\\"ur\\\"/\"'"
         ]
     )
     robot_description = {"robot_description": robot_description_content}
@@ -43,7 +43,7 @@ def generate_launch_description():
         parameters=[robot_description, {"use_sim_time": use_sim_time}],
     )
 
-    # 3. MoveIt2 Launch
+    # 3. MoveIt2 Launch (This will use 'ur' as robot name by default)
     ur_moveit_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(ur_moveit_config_pkg, "launch", "ur_moveit.launch.py")
