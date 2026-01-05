@@ -85,6 +85,14 @@ def generate_launch_description():
         parameters=[{"port": 9090, "use_sim_time": use_sim_time}]
     )
 
+    moveit_bridge_node = Node(
+        package="ur5e_unity_bridge",
+        executable="moveit_bridge",
+        name="moveit_bridge_node",
+        output="screen",
+        parameters=[{"use_sim_time": use_sim_time}]
+    )
+
     return LaunchDescription([
         ros2_control_node,
         robot_state_publisher_node,
@@ -93,4 +101,5 @@ def generate_launch_description():
         scaled_joint_trajectory_controller_spawner,
         bridge_node,
         rosbridge_node,
+        moveit_bridge_node,
     ])

@@ -10,7 +10,7 @@ from std_srvs.srv import Trigger
 from sensor_msgs.msg import JointState
 from control_msgs.msg import JointJog
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from moveit_msgs.srv import GetCartesianPath
+# from moveit_msgs.srv import GetCartesianPath # Removed service import
 
 class UR5eUnityBridge(Node):
     def __init__(self):
@@ -39,9 +39,8 @@ class UR5eUnityBridge(Node):
         self.unity_twist_sub = self.create_subscription(TwistStamped, '/servo_node/delta_twist_cmds_unity', self.unity_twist_callback, self.qos)
         self.unity_trajectory_sub = self.create_subscription(JointTrajectory, '/unity/joint_trajectory', self.unity_trajectory_callback, 10)
         
-        # 3. Service Bridge
-        self.cartesian_path_service = self.create_service(GetCartesianPath, '/compute_cartesian_path', self.compute_cartesian_path_callback)
-        self.moveit_cartesian_client = self.create_client(GetCartesianPath, 'compute_cartesian_path')
+        # 3. Service Bridge (Removed Cartesian Proxy to prevent conflict)
+        # Unity should use /move_robot_to_pose served by moveit_bridge.py
         
         # 4. Status Subscribers (Robot -> Bridge)
         self.robot_joint_state_sub = self.create_subscription(JointState, '/joint_states', self.robot_joint_state_callback, 10)
@@ -51,7 +50,6 @@ class UR5eUnityBridge(Node):
         self.msg_count = {"twist": 0, "joint_cmd": 0, "joint_state": 0, "jog": 0}
         self.last_servo_cmd_time = self.get_clock().now()
         self.current_servo_status = 0 # 0: Normal
-        self.timer = self.create_timer(1.0, self.check_log_rate)
 
         # 5. Service Clients (For Servo Control)
         self.start_servo_client = self.create_client(Trigger, '/servo_node/start_servo')
@@ -59,22 +57,23 @@ class UR5eUnityBridge(Node):
         # 6. Automatic Startup Logic
         self.servo_started = False
         self.auto_start_timer = self.create_timer(2.0, self.auto_start_callback)
+        
+        # 7. Throttling Logic (To prevent rosbridge overload)
+        self.last_joint_pub_time = 0.0
+        self.pub_interval = 1.0 / 30.0 # 30Hz limit for Unity
 
         self.get_logger().info("==========================================")
         self.get_logger().info("   UR5e Unity Bridge [v2.2 - Optimized]   ")
         self.get_logger().info("==========================================")
 
-    def check_log_rate(self):
-        """통신 상태 모니터링 (1Hz)"""
-        self.get_logger().info(
-            f"Hz Check | Twist:{self.msg_count['twist']} | JointCmd:{self.msg_count['joint_cmd']} | "
-            f"JointState:{self.msg_count['joint_state']} | Jog:{self.msg_count['jog']}"
-        )
-        # 카운터 초기화
-        for key in self.msg_count: self.msg_count[key] = 0
 
     def robot_joint_state_callback(self, msg: JointState):
-        """로봇 -> Unity 상태 동기화"""
+        """로봇 -> Unity 상태 동기화 (30Hz Throttling 적용)"""
+        current_time = time.time()
+        if (current_time - self.last_joint_pub_time) < self.pub_interval:
+            return # 전송 빈도 제한
+            
+        self.last_joint_pub_time = current_time
         self.msg_count["joint_state"] += 1
         new_msg = JointState()
         # [중요] Unity 타임스탬프 문제를 해결하기 위해 ROS 시간으로 덮어씀
@@ -85,6 +84,10 @@ class UR5eUnityBridge(Node):
         new_msg.velocity = msg.velocity
         new_msg.effort = [0.0] * len(msg.name)
         self.unity_joint_state_pub.publish(new_msg)
+        
+        # 주기적으로 통신 상태 확인을 위한 디버그 로그 (100번마다 한 번)
+        if self.msg_count["joint_state"] % 100 == 0:
+            self.get_logger().info(f"Published 100 JointStates to Unity. Total: {self.msg_count['joint_state']}", once=False)
 
     def unity_twist_callback(self, msg: TwistStamped):
         """Unity -> Servo Twist 명령 (Cartesian Jog)"""
@@ -120,12 +123,21 @@ class UR5eUnityBridge(Node):
 
     def unity_joint_traj_callback(self, msg: JointState):
         """Unity -> Scaled Controller (Move to Pose 등)"""
-        if not msg.name or not msg.position: return
+        # Debug: Check if callback is triggered
+        if not msg.name or not msg.position:
+            # self.get_logger().info(f"Empty data from Unity: name={len(msg.name)}, pos={len(msg.position)}")
+            return
+            
+        # 상세 수치 로깅 추가
+        joint_info = [f"{n}: {p:.4f}" for n, p in zip(msg.name, msg.position)]
+        self.get_logger().info(f"Joint command received:\n" + "\n".join(joint_info))
+        
         self.msg_count["joint_cmd"] += 1
         
         # Servo와 Controller 간의 충돌 방지 (Servo 사용 직후엔 잠시 대기)
         dt = (self.get_clock().now() - self.last_servo_cmd_time).nanoseconds / 1e9
         if dt < 0.5:
+            self.get_logger().warn("Skipping joint command: Too soon after Servo command")
             return
 
         traj_msg = JointTrajectory()
@@ -150,18 +162,9 @@ class UR5eUnityBridge(Node):
         if not msg.header.frame_id: msg.header.frame_id = "base_link"
         self.robot_traj_pub.publish(msg)
 
-    async def compute_cartesian_path_callback(self, request, response):
-        """Unity -> MoveIt Cartesian Path 계산 서비스 중계"""
-        if request.header.frame_id == "":
-            request.header.frame_id = "base_link"
-            
-        if not self.moveit_cartesian_client.service_is_ready():
-            self.get_logger().warn("MoveIt Cartesian 서비스가 준비되지 않았습니다.")
-            return response
-            
-        # 비동기 호출로 MoveIt에 경로 계산 요청
-        result = await self.moveit_cartesian_client.call_async(request)
-        return result
+    # async def compute_cartesian_path_callback(self, request, response):
+    #     """REMOVED: Use moveit_bridge.py's /move_robot_to_pose instead"""
+    #     pass
 
     def robot_servo_status_callback(self, msg: Int8):
         """Servo 상태 모니터링 및 로깅"""
@@ -211,8 +214,13 @@ class UR5eUnityBridge(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = UR5eUnityBridge()
+    
+    from rclpy.executors import MultiThreadedExecutor
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     except Exception as e:
