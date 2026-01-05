@@ -3,13 +3,23 @@
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-echo "Step 0: Cleaning up previous processes..."
-pkill -f bridge_node || true
-pkill -f rviz2 || true
-pkill -f ros2_control_node || true
-pkill -f robot_state_publisher || true
-pkill -f move_group || true
-pkill -f rosbridge_websocket || true
+echo "Step 0: Deep cleaning ROS 2 and stale processes..."
+# Stop ROS 2 daemon to clear DDS cache
+ros2 daemon stop || true
+
+# Kill all possible ROS/Bridge related processes
+pkill -9 -f bridge_node || true
+pkill -9 -f moveit_bridge || true
+pkill -9 -f rviz2 || true
+pkill -9 -f move_group || true
+pkill -9 -f rosbridge_websocket || true
+pkill -9 -f robot_state_publisher || true
+pkill -9 -f ros2_control_node || true
+pkill -9 -f controller_manager || true
+pkill -9 -f spawner || true
+
+# Force clear any remaining shared memory (if using FastDDS)
+rm -rf ~/.ros/log/*
 sleep 2
 
 echo "Step 1: Building..."
