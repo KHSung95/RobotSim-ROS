@@ -19,7 +19,8 @@ find_package(control_msgs REQUIRED)
 # Generate custom interfaces
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/MoveToPose.srv"
-  DEPENDENCIES geometry_msgs
+  "srv/CalculateICP.srv"
+  DEPENDENCIES geometry_msgs sensor_msgs
 )
 
 # Install Python scripts as executables
@@ -33,6 +34,12 @@ install(PROGRAMS
   scripts/moveit_bridge.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME moveit_bridge
+)
+
+install(PROGRAMS
+  scripts/icp_server.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME icp_server
 )
 
 # Install other directories
