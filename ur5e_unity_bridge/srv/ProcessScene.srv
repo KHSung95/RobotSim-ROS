@@ -1,0 +1,8 @@
+string command
+float32 threshold
+sensor_msgs/PointCloud2 input_cloud
+---
+bool success
+float32 match_score
+sensor_msgs/PointCloud2 result_cloud
+float32[16] correction_matrix

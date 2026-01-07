@@ -1,0 +1,7 @@
+sensor_msgs/PointCloud2 master_point_cloud
+sensor_msgs/PointCloud2 current_point_cloud
+---
+# Flattened 4x4 Transformation Matrix (Row-Major)
+float32[16] transformation_matrix
+bool success
+float64 fitness

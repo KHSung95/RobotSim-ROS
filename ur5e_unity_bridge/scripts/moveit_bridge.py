@@ -150,10 +150,10 @@ class MoveItBridgeNode(Node):
         req.workspace_parameters.header.frame_id = self.reference_frame
         req.start_state.is_diff = True
         req.group_name = self.group_name
-        req.num_planning_attempts = 5
-        req.allowed_planning_time = 3.0
-        req.max_velocity_scaling_factor = 0.1
-        req.max_acceleration_scaling_factor = 0.1
+        req.num_planning_attempts = 10
+        req.allowed_planning_time = 2.0
+        req.max_velocity_scaling_factor = 0.8  # Increase from 0.1 to 0.8
+        req.max_acceleration_scaling_factor = 0.5 # Increase from 0.1 to 0.5
         
         c = Constraints()
         pc = PositionConstraint()
