@@ -101,6 +101,14 @@ def generate_launch_description():
         parameters=[{"use_sim_time": use_sim_time}]
     )
 
+    pointcloud_processor_node = Node(
+        package="ur5e_unity_bridge",
+        executable="pointcloud_processor",
+        name="pointcloud_processor",
+        output="screen",
+        parameters=[{"use_sim_time": use_sim_time}]
+    )
+
     return LaunchDescription([
         ros2_control_node,
         robot_state_publisher_node,
@@ -111,4 +119,5 @@ def generate_launch_description():
         rosbridge_node,
         moveit_bridge_node,
         icp_server_node,
+        pointcloud_processor_node,
     ])

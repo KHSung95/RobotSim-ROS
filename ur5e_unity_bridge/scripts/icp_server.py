@@ -96,7 +96,7 @@ class ICPServiceServer(Node):
         reg_coarse = o3d.pipelines.registration.registration_icp(
             source_down, target_down, coarse_threshold, trans_init,
             o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=2000)
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50)
         )
         self.get_logger().info(f"Pass 1 Fitness: {reg_coarse.fitness:.4f}")
 
@@ -109,7 +109,7 @@ class ICPServiceServer(Node):
             reg_fine = o3d.pipelines.registration.registration_icp(
                 source_down, target_down, fine_threshold, reg_coarse.transformation,
                 o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=2000)
+                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50)
             )
         except Exception as e:
             self.get_logger().warn(f"Point-to-Plane failed ({e}), keeping Coarse result.")

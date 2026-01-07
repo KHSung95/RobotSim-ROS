@@ -20,6 +20,7 @@ find_package(control_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/MoveToPose.srv"
   "srv/CalculateICP.srv"
+  "srv/ProcessScene.srv"
   DEPENDENCIES geometry_msgs sensor_msgs
 )
 
@@ -40,6 +41,12 @@ install(PROGRAMS
   scripts/icp_server.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME icp_server
+)
+
+install(PROGRAMS
+  scripts/pointcloud_processor.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME pointcloud_processor
 )
 
 # Install other directories
